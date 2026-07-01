@@ -1,0 +1,7 @@
+venv/
+.venv/
+.gigaide/
+.idea/
+.streamlit/
+*.iml
+*.mp3
