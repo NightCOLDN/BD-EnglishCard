@@ -1,7 +1,39 @@
-venv/
+# Секреты и доступы приложения (Критически важно!)
+.streamlit/secrets.toml
+
+# Локальные файлы логов и отладки
+*.log
+app.log
+
+# Виртуальное окружение Python
 .venv/
+venv/
+ENV/
+
+# Кэш компиляции Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Настройки среды разработки (IDE)
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# Системные файлы операционных систем
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Файлы проекта программы
 .gigaide/
 .idea/
-.streamlit/
+
+# Другие файлы
 *.iml
 *.mp3

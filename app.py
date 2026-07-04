@@ -1,434 +1,408 @@
+import os
+import sys
+from typing import List, Dict, Any, Optional
+
+# Фиксируем корень проекта
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import streamlit as st
-import random
-import base64
-import streamlit.components.v1 as components
 import pandas as pd
-from database.connection import get_db_engine
+import re
+from database.connection import get_db_engine, get_db_session
+from database.schema import DATABASE_SCHEMA_TEXT
 from sqlalchemy import text
-from database.connection import init_db
 from database.queries import (
-    get_available_words,
-    generate_quiz_options,
+    get_quiz_round_data,
     add_custom_word,
     delete_word_for_user,
-    authenticate_user,
-    register_user,
     log_user_answer,
     get_user_statistics,
     get_user_words_count
 )
+# Импорт сопутствующих конфигураций и служебных модулей
+from config import QUESTIONS_PER_ROUND
+from utils.state import init_session_states, reset_session_logout
+from utils.effects import trigger_confetti, play_success_sound
+from components.auth import run_authentication
+from utils.logger import log
 
-# Настройка страницы (обязательно первой строчкой)
-st.set_page_config(page_title="EnglishCard", page_icon="📚", layout="wide")
 
-# Автоматическая проверка и создание всех таблиц при старте приложения
-init_db()
+def next_question() -> None:
+    """Обновляет состояние карточки, запрашивая новые 4 случайные пары одной строкой."""
+    if not st.session_state.user_info:
+        return
 
-# ==============================================================================
-# БЛОК ЭФФЕКТОВ (АНИМАЦИЯ И ЗВУК)
-# ==============================================================================
-def trigger_confetti():
-    """Запускает анимацию конфетти на экране через JS-скрипт Canvas-Confetti."""
-    confetti_js = """
-    <script src="https://jsdelivr.net"></script>
-    <script>
-        function launch() {
-            const target = window.parent.confetti ? window.parent.confetti : confetti;
-            target({
-                particleCount: 150,
-                spread: 80,
-                origin: { y: 0.6 },
-                zIndex: 9999
-            });
-        }
-        launch();
-    </script>
-    """
-    components.html(confetti_js, height=1, width=1)
+    if st.session_state.round_question_count >= QUESTIONS_PER_ROUND:
+        st.session_state.round_finished = True
+        st.session_state.current_word = None
+        return
 
-def play_success_sound():
-    try:
-        with open("win.mp3", "rb") as f:
-            data = f.read()
-            b64 = base64.b64encode(data).decode()
-            audio_html = f"""
-                <audio autoplay style="display:none;">
-                    <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-                </audio>
-            """
-            st.markdown(audio_html, unsafe_allow_html=True)
-    except FileNotFoundError:
-        pass  # Если файла нет, приложение продолжит работу без звука
+    user_id: int = st.session_state.user_info["id"]
+    quiz_data: Optional[Dict[str, Any]] = get_quiz_round_data(user_id)
 
-# ==============================================================================
-# ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЙ СЕССИИ (SESSION STATE)
-# ==============================================================================
-QUESTIONS_PER_ROUND = 10
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user_info" not in st.session_state:
-    st.session_state.user_info = None
-if "current_word" not in st.session_state:
-    st.session_state.current_word = None
-if "options" not in st.session_state:
-    st.session_state.options = []
-if "answer_status" not in st.session_state:
-    st.session_state.answer_status = None
-if "used_words" not in st.session_state: # Список для хранения ID недавно показанных слов
-    st.session_state.used_words = []
-#  Переменные для ограничения раунда обучения
-if "round_question_count" not in st.session_state:
-    st.session_state.round_question_count = 0  # Сколько слов показано в этом раунде
-if "round_correct_count" not in st.session_state:
-    st.session_state.round_correct_count = 0   # Сколько правильных ответов дано за раунд
-if "round_finished" not in st.session_state:
-    st.session_state.round_finished = False    # Завершен ли текущий раунд
-
-# Был ли ошибочный ответ на текущее слово
-if "current_word_fault" not in st.session_state:
-    st.session_state.current_word_fault = False
-
-def next_question():
-    """Выбирает случайное слово, учитывая лимиты текущего раунда."""
-    if st.session_state.user_info:
-        # Проверяем, не достигнут ли лимит раунда
-        if st.session_state.round_question_count >= QUESTIONS_PER_ROUND:
-            st.session_state.round_finished = True
-            st.session_state.current_word = None
-            return
-
-        user_id = st.session_state.user_info["id"]
-        all_words = get_available_words(user_id)
-
-        if not all_words:   # ЗАЩИТА: Если в базе вообще нет слов (все удалены или еще не добавлены)
-            st.session_state.current_word = None
-            st.session_state.options = []
-            st.session_state.answer_status = None
-            return
-
-        # Фильтрация повторений
-        fresh_words = [w for w in all_words if w["id"] not in st.session_state.used_words]
-        if not fresh_words:
-            st.session_state.used_words = []
-            fresh_words = all_words
-
-        # ЗАЩИТА: Дополнительная проверка перед выбором
-        if fresh_words:
-            selected_word = random.choice(fresh_words)
-            st.session_state.used_words.append(selected_word["id"])
-
-            if len(st.session_state.used_words) > min(5, len(all_words) - 1):
-                st.session_state.used_words.pop(0)
-
-            st.session_state.round_question_count += 1
-            st.session_state.current_word = selected_word
-            st.session_state.options = generate_quiz_options(user_id, selected_word)
-            st.session_state.answer_status = None
-            st.session_state.current_word_fault = False
-        else:
-            st.session_state.current_word = None
-
-        selected_word = random.choice(fresh_words)
-        st.session_state.used_words.append(selected_word["id"])
-
-        if len(st.session_state.used_words) > min(5, len(all_words) - 1):
-            st.session_state.used_words.pop(0)
-
-        # Увеличиваем счетчик вопросов в раунде
-        st.session_state.round_question_count += 1
-
-        st.session_state.current_word = selected_word
-        st.session_state.options = generate_quiz_options(user_id, selected_word)
-        st.session_state.answer_status = None
-
-        # Новое слово начинается без ошибок!
-        st.session_state.current_word_fault = False
-
-# ==============================================================================
-# ЭКРАН АВТОРИЗАЦИИ И РЕГИСТРАЦИИ (Блокирует интерфейс для гостей)
-# ==============================================================================
-if not st.session_state.logged_in:
-    st.title("🔐 Авторизация в EnglishCard")
-
-    auth_tab1, auth_tab2 = st.tabs(["🔑 Вход", "📝 Регистрация"])
-
-    with auth_tab1:
-        st.subheader("Войти в существующий аккаунт")
-        login_user = st.text_input("Имя пользователя:", key="login_username")
-        login_pass = st.text_input("Пароль:", type="password", key="login_password")
-
-        if st.button("Войти", type="primary", key="btn_login_submit"):
-            user = authenticate_user(login_user, login_pass)
-            if user:
-                st.session_state.logged_in = True
-                st.session_state.user_info = user
-                next_question()  # Генерируем первое слово
-                st.success("Успешный вход!")
-                st.rerun()
-            else:
-                st.error("Неверное имя пользователя или пароль.")
-
-    with auth_tab2:
-        st.subheader("Создать новый аккаунт")
-        reg_user = st.text_input("Придумайте имя пользователя:", key="reg_username")
-        reg_pass = st.text_input("Придумайте пароль:", type="password", key="reg_password")
-
-        if st.button("Зарегистрироваться", key="btn_register_submit"):
-            if reg_user and reg_pass:
-                if register_user(reg_user, reg_pass):
-                    st.success("Аккаунт успешно создан! Теперь вы можете войти на соседней вкладке.")
-                else:
-                    st.error("Это имя пользователя уже занято.")
-            else:
-                st.warning("Пожалуйста, заполните все поля.")
-
-    st.stop()  # Жесткая остановка. Все, что написано ниже, увидят ТОЛЬКО авторизованные!
-
-# ==============================================================================
-# БОКОВАЯ ПАНЕЛЬ (Доступна строго после авторизации)
-# ==============================================================================
-USER_ID = st.session_state.user_info["id"]
-USER_NAME = st.session_state.user_info["username"]
-
-with st.sidebar:
-    st.header("👤 Профиль")
-    st.success(f"Вы вошли как: **{USER_NAME}**")
-
-    if st.button("Выйти", type="secondary", key="btn_logout_sidebar"):
-        st.session_state.logged_in = False
-        st.session_state.user_info = None
+    if not quiz_data:
         st.session_state.current_word = None
         st.session_state.options = []
         st.session_state.answer_status = None
-        st.rerun()
+        return
 
-# ==============================================================================
-# ОСНОВНОЙ ИНТЕРФЕЙС ПРИЛОЖЕНИЯ
-# ==============================================================================
-st.title("📚 EnglishCard - Изучай английский с удовольствием!")
+    st.session_state.round_question_count += 1
+    st.session_state.current_word = quiz_data["current_word"]
+    st.session_state.options = quiz_data["options"]
+    st.session_state.answer_status = None
+    st.session_state.current_word_fault = False
 
-# Если пользователь вошел, но слово еще не выбрано (например, после удаления последнего слова)
-if st.session_state.current_word is None:
-    next_question()
+def lern_func(user_id: int) -> None:
+    """Логика вкладки 1: Изучение слов в стиле Минималистичный Премиум."""
+    st.header("🎯 Изучаем слова")
 
-tab_learn, tab_add, tab_delete, tab_stats = st.tabs([
-    "📖 Изучение",
-    "➕ Добавить слово",
-    "🗑️ Удалить слово",
-    "📊 Статистика"
-])
-
-# ------------------------------------------------------------------------------
-# ВКЛАДКА 1: ИЗУЧЕНИЕ СЛОВ
-# ------------------------------------------------------------------------------
-
-with tab_learn:
-    st.header("📖 Изучаем слова")
-
-    # 1. ПРОВЕРКА: Если раунд завершен, выводим экран итогов
     if st.session_state.round_finished:
-        st.balloons() # Анимация воздушных шаров в честь окончания урока
+        st.balloons()
         st.success("🎉 Поздравляем! Вы завершили раунд обучения!")
+        score_percent: int = round((st.session_state.round_correct_count / QUESTIONS_PER_ROUND) * 100)
 
-        score_percent = round((st.session_state.round_correct_count / QUESTIONS_PER_ROUND) * 100)
-
+        # Элегантные минималистичные карточки результатов
         res_col1, res_col2 = st.columns(2)
         with res_col1:
-            st.metric(label="Показано слов в раунде", value=QUESTIONS_PER_ROUND)
+            st.markdown(
+                f"""
+                <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; padding: 15px; border-radius: 8px; text-align: center;">
+                    <p style="margin: 0; color: #64748B; font-size: 14px; font-weight: 500;">Показано слов</p>
+                    <p style="margin: 5px 0 0 0; color: #0F172A; font-size: 24px; font-weight: 600;">{QUESTIONS_PER_ROUND}</p>
+                </div>
+                """, unsafe_allow_html=True
+            )
         with res_col2:
-            st.metric(label="Правильных ответов", value=f"{st.session_state.round_correct_count} из {QUESTIONS_PER_ROUND}")
+            st.markdown(
+                f"""
+                <div style="background-color: #F8FAFC; border: 1px solid #E2E8F0; padding: 15px; border-radius: 8px; text-align: center;">
+                    <p style="margin: 0; color: #64748B; font-size: 14px; font-weight: 500;">Правильных ответов</p>
+                    <p style="margin: 5px 0 0 0; color: #0F172A; font-size: 24px; font-weight: 600;">{st.session_state.round_correct_count} из {QUESTIONS_PER_ROUND}</p>
+                </div>
+                """, unsafe_allow_html=True
+            )
 
-        st.info(f"Ваша точность в этом раунде составила: **{score_percent}%**")
-
-        if st.button("🔄 Начать новый раунд", type="primary", use_container_width=True, key="btn_restart_round"):
+        st.markdown(f"<p style='color: #475569; margin-top: 15px;'>Ваша точность в этом раунде: <b>{score_percent}%</b></p>", unsafe_allow_html=True)
+        if st.button("🔄 Начать новый раунд", type="primary", use_container_width=True):
             st.session_state.round_question_count = 0
             st.session_state.round_correct_count = 0
             st.session_state.round_finished = False
             next_question()
             st.rerun()
 
-    # 2. Если раунд еще идет и слово выбрано — показываем интерфейс теста
     elif st.session_state.current_word:
-        st.caption(f"Прогресс раунда: Вопрос **{st.session_state.round_question_count}** из **{QUESTIONS_PER_ROUND}**")
+        # Тонкий аккуратный Progress Bar
+        progress_percentage = min(st.session_state.round_question_count / QUESTIONS_PER_ROUND, 1.0)
+        st.progress(progress_percentage)
+        st.caption(f"Вопрос {st.session_state.round_question_count} из {QUESTIONS_PER_ROUND}")
 
-        col_word, col_status = st.columns(2)
-        with col_word:
-            st.markdown(f"### Слово: **{st.session_state.current_word['ru'].lower()}**")
-            st.markdown("#### Как будет по-английски?")
-            st.markdown("##### Выберите перевод: 🔗")
+        # Элегантная белая карточка с тонкой рамкой и мягкой тенью
+        ru_word: str = st.session_state.current_word['ru'].lower()
+        st.markdown(
+            f"""
+            <div style="
+                display: flex; 
+                justify-content: center; 
+                align-items: center; 
+                width: 100%; 
+                background-color: #FFFFFF; 
+                border: 1px solid #E2E8F0;
+                padding: 25px 0px; 
+                border-radius: 10px; 
+                margin-top: 10px;
+                margin-bottom: 25px;
+                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            ">
+                <h1 style="color: #0F172A; margin: 0; font-size: 32px; text-transform: capitalize; font-weight: 600; letter-spacing: -0.5px;">
+                    {ru_word}
+                </h1>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-        with col_status:
-            if st.session_state.answer_status == "correct":
-                st.success("✅ Правильно! Молодец!")
-                trigger_confetti()
-                play_success_sound()
-            elif st.session_state.answer_status == "incorrect":
-                st.error("❌ Неверно. Попробуй ответить заново! Попытки не ограничены.")
+        st.markdown("<p style='text-align: center; color: #64748B; font-size: 20px; margin-bottom: 20px;'>Выберите правильный перевод слова на английский язык:</p>", unsafe_allow_html=True)
 
-        # Выводим 4 варианта ответа в одну горизонтальную строку
+        # Тонкие минималистичные кнопки вариантов ответов
+        st.markdown(
+            """
+            <style>
+                div.stButton > button {
+                    font-size: 16px !important;
+                    font-weight: 500 !important;
+                    background-color: #FFFFFF !important;
+                    color: #334155 !important;
+                    border: 1px solid #E2E8F0 !important;
+                    padding: 10px 20px !important;
+                    border-radius: 8px !important;
+                    transition: all 0.15s ease-in-out !important;
+                }
+                div.stButton > button:hover {
+                    border-color: #94A3B8 !important;
+                    background-color: #F8FAFC !important;
+                    color: #0F172A !important;
+                }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+
         cols = st.columns(4)
         for i, option in enumerate(st.session_state.options):
             with cols[i]:
-                # Кнопки блокируются СТРОГО только после нахождения правильного ответа
-                is_disabled = (st.session_state.answer_status == "correct")
-
+                is_disabled: bool = (st.session_state.answer_status == "correct")
                 if st.button(option, key=f"opt_{option}_{i}", use_container_width=True, disabled=is_disabled):
                     if option == st.session_state.current_word["en"]:
                         st.session_state.answer_status = "correct"
-                        log_user_answer(USER_ID, True)
-
+                        log_user_answer(user_id, True)
                         if not st.session_state.current_word_fault:
                             st.session_state.round_correct_count += 1
                     else:
                         st.session_state.answer_status = "incorrect"
-                        log_user_answer(USER_ID, False)
-                        # Запоминаем, что пользователь совершил ошибку на этом слове
+                        log_user_answer(user_id, False)
                         st.session_state.current_word_fault = True
                     st.rerun()
 
-        # Кнопка перехода к следующему слову (выровнена внутри блока elif)
         if st.session_state.answer_status == "correct":
-            st.markdown("")
-            if st.button("➡️ Следующее слово", use_container_width=True, key="btn_next_word_clean"):
-                next_question()
-                st.rerun()
-
-    # 3. Кейс, когда слов в базе вообще не осталось (all_words пустой)
+            st.markdown("<br>", unsafe_allow_html=True)
+            _, center_col, _ = st.columns([1, 2, 1])
+            with center_col:
+                if st.button("➡️ Следующее слово", type="primary", use_container_width=True):
+                    next_question()
+                    st.rerun()
     else:
         st.warning("⚠️ В вашем словаре не осталось доступных слов для изучения!")
-        st.info("💡 Похоже, вы удалили или скрыли все базовые слова. Чтобы продолжить тренировки, перейдите во вкладку **'➕ Добавить слово'** выше и добавьте свои собственные слова в личный словарь.")
 
-        # Кнопка переключения появляется только при успешном ответе
-        if st.session_state.answer_status == "correct":
-            st.markdown("")
-            if st.button("➡️ Следующее слово", use_container_width=True, key="btn_next_word_clean"):
-                next_question()
-                st.rerun()
+    st.markdown("---")
+    with st.expander("📊 Посмотреть схему базы данных (Database Schema)"):
+        st.code(DATABASE_SCHEMA_TEXT, language="text")
 
-        st.info("В вашем словаре нет доступных слов. Добавьте их во вкладке выше.")
+# def add_word_func(user_id: int) -> None:
+#     """Логика вкладки 2: Добавление нового слова в горизонтальной сетке Clean-стиля."""
+#     st.header("➕ Добавление слова")
+#     st.markdown("<p style='color: #64748B; margin-bottom: 20px;'>Введите слово и его перевод для расширения вашего личного словаря.</p>", unsafe_allow_html=True)
+#
+#     with st.form(key="add_word_form", clear_on_submit=True):
+#         # Располагаем поля в элегантную двухколоночную сетку
+#         col_ru, col_en = st.columns(2)
+#         with col_ru:
+#             new_ru = st.text_input("Слово на русском:", placeholder="например, собака")
+#         with col_en:
+#             new_en = st.text_input("Перевод на английский:", placeholder="например, dog")
+#
+#         # Аккуратное смещение кнопки вправо
+#         _, btn_col = st.columns([3, 1])
+#         with btn_col:
+#             submit_word = st.form_submit_button("Сохранить слово", type="primary", use_container_width=True)
+#
+#     if submit_word:
+#         cleaned_ru = new_ru.strip().lower()
+#         cleaned_en = new_en.strip().lower()
+#
+#         if not cleaned_ru or not cleaned_en:
+#             st.warning("Пожалуйста, заполните оба поля.")
+#         elif not cleaned_en.isascii():
+#             st.error("Английское слово должно быть написано латинскими буквами!")
+#         else:
+#             result = add_custom_word(user_id, cleaned_en, cleaned_ru)
+#             if result == "success":
+#                 st.success(f"Слово '{cleaned_en}' успешно добавлено в ваш словарь!")
+#                 next_question()
+#                 st.rerun()
+#             elif result == "global_exists":
+#                 st.error(f"Слово '{cleaned_en}' уже есть в общем базовом словаре!")
+#             elif result == "custom_exists":
+#                 st.warning(f"Вы уже добавляли слово '{cleaned_en}' в личный словарь ранее.")
+def add_word_func(user_id: int) -> None:
+    """Логика вкладки 2: Добавление нового слова с жесткой валидацией кириллицы/латиницы."""
+    st.header("➕ Добавление слова")
+    st.markdown("<p style='color: #64748B; margin-bottom: 20px;'>Введите слово и его перевод для расширения вашего личного словаря.</p>", unsafe_allow_html=True)
 
-    st.markdown("")
-    with st.expander("📂 Посмотреть схему базы данных (Database Schema)"):
-        st.write("Ниже представлена физическая реляционная схема базы данных PostgreSQL для данного проекта:")
+    with st.form(key="add_word_form", clear_on_submit=True):
+        col_ru, col_en = st.columns(2)
+        with col_ru:
+            new_ru = st.text_input("Слово на русском:", placeholder="например, собака")
+        with col_en:
+            new_en = st.text_input("Перевод на английский:", placeholder="например, dog")
 
-        # Переносим схему без лишних внутренних табуляций, чтобы Python не выдавал ошибку
-        schema_text = """
-  +-----------------------------------+
+        _, btn_col = st.columns()
+        with btn_col:
+            submit_word = st.form_submit_button("Сохранить слово", type="primary", use_container_width=True)
 
-  |               USERS               |  <-- Пользователи системы
-  +-----------------------------------+
-
-  | id (PK)           : SERIAL        |
-  | username          : VARCHAR(50)   |
-  | password_hash     : VARCHAR(255)  |
-  +-----------------------------------+
-
-           |                 |
-           | (1 : N)         | (1 : N)
-           v                 v
-  +-----------------+  +-----------------------------------+
-
-  |   USER_STATS    |  |         USER_CUSTOM_WORDS         | <-- Личные слова
-  +-----------------+  +-----------------------------------+
-
-  | id (PK) : SERIAL|  | id (PK)           : SERIAL        |
-  | user_id : INT   |  | user_id (FK)      : INTEGER       |
-  | is_correct: BOOL|  | word_en           : VARCHAR(100)  |
-  | answered_at:TS  |  | word_ru           : VARCHAR(100)  |
-  +-----------------+  +-----------------------------------+
-                             |
-                             | (1 : N)
-                             v
-  +-----------------------------------+      +-----------------------------------+
-
-  |        USER_DELETED_WORDS         |      |           GLOBAL_WORDS            | <-- Базовые слова
-  +-----------------------------------+      +-----------------------------------+
-
-  | id (PK)           : SERIAL        |      | id (PK)           : SERIAL        |
-  | user_id           : INTEGER       |      | word_en           : VARCHAR(100)  |
-  | global_word_id(FK): INTEGER ------------>| word_ru           : VARCHAR(100)  |
-  +-----------------------------------+      +-----------------------------------+
-        """
-        st.code(schema_text, language="text")
-
-# ------------------------------------------------------------------------------
-# ВКЛАДКА 2: ДОБАВЛЕНИЕ СЛОВА
-# ------------------------------------------------------------------------------
-with tab_add:
-    st.header("➕ Добавление нового слова в личный словарь")
-    new_ru = st.text_input("Слово на русском:", key="add_ru")
-    new_en = st.text_input("Перевод на английский:", key="add_en")
-
-    if st.button("Сохранить слово", type="primary"):
+    if submit_word:
+        # Элегантная очистка от случайных пробелов по краям и перевод в нижний регистр
         cleaned_ru = new_ru.strip().lower()
         cleaned_en = new_en.strip().lower()
 
+        # Регулярные выражения: только буквы и дефис (для составных слов типа "он-лайн" или "ice-cream")
+        cyrillic_pattern = re.compile(r"^[а-яё\-]+$")
+        latin_pattern = re.compile(r"^[a-z\-]+$")
+
         if not cleaned_ru or not cleaned_en:
-            st.warning("Пожалуйста, заполните оба поля.")
-        elif not cleaned_en.isascii():
-            st.error("Английское слово должно быть написано латинскими буквами!")
+            st.warning("⚠️ Пожалуйста, заполните оба поля.")
+        # Валидация русского поля
+        elif not cyrillic_pattern.match(cleaned_ru):
+            st.error("❌ Поле 'Слово на русском' должно содержать только русские буквы (кириллицу) без цифр и символов!")
+        # Валидация английского поля
+        elif not latin_pattern.match(cleaned_en):
+            st.error("❌ Поле 'Перевод на английский' должно содержать только английские буквы (латиницу) без цифр и символов!")
         else:
-            add_custom_word(USER_ID, cleaned_en, cleaned_ru)
-            st.success(f"Слово '{cleaned_en}' успешно добавлено в ваш словарь!")
-            next_question()
+            # Если валидация успешна, отправляем чистые данные в базу
+            result = add_custom_word(user_id, cleaned_en, cleaned_ru)
+            if result == "success":
+                st.success(f"🎉 Слово '{cleaned_en}' успешно добавлено в ваш словарь!")
+                next_question()
+                st.rerun()
+            elif result == "global_exists":
+                st.error(f"ℹ️ Слово '{cleaned_en}' уже есть в общем базовом словаре!")
+            elif result == "custom_exists":
+                st.warning(f"⚠️ Вы уже добавляли слово '{cleaned_en}' в личный словарь ранее.")
 
- # ------------------------------------------------------------------------------
- # ВКЛАДКА 3: УДАЛЕНИЕ СЛОВА
- # ------------------------------------------------------------------------------
+def delete_word_func(user_id: int) -> None:
+    """Логика вкладки 3: Персональное сдержанное удаление слов."""
+    st.header("🗑️ Исключение слов")
+    st.markdown("<p style='color: #64748B; margin-bottom: 20px;'>Если вы уже идеально запомнили слово, вы можете временно убрать его из текущего пула обучения.</p>", unsafe_allow_html=True)
 
-with tab_delete:
-    st.header("🗑️ Персональное удаление слов")
     if st.session_state.current_word:
-        st.write(f"Вы можете удалить текущее слово из своего списка: **{st.session_state.current_word['ru']}**")
-        # ИСПРАВЛЕНО: Убедитесь, что здесь тоже уникальный ключ
-        if st.button("Удалить текущее слово", type="primary", key="delete_current_word"):
-            delete_word_for_user(USER_ID, st.session_state.current_word)
-            st.toast("Слово скрыто из вашего словаря!")
-            next_question()
-            st.rerun()
+        # Карточка-информатор
+        st.markdown(
+            f"""
+            <div style="background-color: #F8FAFC; border-left: 4px solid #94A3B8; padding: 15px; border-radius: 4px; margin-bottom: 20px;">
+                <span style="color: #475569; font-size: 15px;">Текущее выбранное слово: </span>
+                <strong style="color: #0F172A; font-size: 16px; text-transform: capitalize;">{st.session_state.current_word['ru']}</strong>
+            </div>
+            """, unsafe_allow_html=True
+        )
 
+        _, btn_col = st.columns([2, 1])
+        with btn_col:
+            # Сдержанная кнопка вместо агрессивного красного цвета
+            if st.button("Удалить текущее слово", type="secondary", use_container_width=True, key="delete_current_word"):
+                delete_word_for_user(user_id, st.session_state.current_word)
+                st.toast("Слово скрыто из вашего словаря!")
+                next_question()
+                st.rerun()
     else:
         st.write("Нет доступных слов для удаления.")
 
-# ------------------------------------------------------------------------------
-# ВКЛАДКА 4: СТАТИСТИКА
-# ------------------------------------------------------------------------------
+def stats_func(user_id: int) -> None:
+    """Логика вкладки 4: Статистика в стиле благородного аналитического дашборда."""
+    st.header("📈 Ваша статистика обучения")
+    stats = get_user_statistics(user_id)
+    total_words = get_user_words_count(user_id)
 
-with tab_stats:
-    st.header("📊 Ваша статистика обучения")
-
-    # Берем актуальные данные из базы
-    stats = get_user_statistics(USER_ID)
-    total_words = get_user_words_count(USER_ID)
-
-    # Выводим показатели в виде интерактивных карточек-метрик в один ряд
+    # Минималистичные карточки метрик с тонкими границами и мягкими тенями
     m_col1, m_col2, m_col3 = st.columns(3)
     with m_col1:
-        st.metric(label="🎒 Слов в обучении", value=total_words)
+        st.markdown(
+            f"""
+            <div style="background-color: #FFFFFF; border: 1px solid #E2E8F0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 2px 0 rgba(0,0,0,0.05);">
+                <p style="margin: 0; color: #64748B; font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">📚 Слов в обучении</p>
+                <p style="margin: 8px 0 0 0; color: #0F172A; font-size: 28px; font-weight: 600;">{total_words}</p>
+            </div>
+            """, unsafe_allow_html=True
+        )
     with m_col2:
-        st.metric(label="🎯 Верных ответов", value=stats["correct"])
+        st.markdown(
+            f"""
+            <div style="background-color: #FFFFFF; border: 1px solid #E2E8F0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 2px 0 rgba(0,0,0,0.05);">
+                <p style="margin: 0; color: #64748B; font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">🎯 Верных ответов</p>
+                <p style="margin: 8px 0 0 0; color: #10B981; font-size: 28px; font-weight: 600;">{stats['correct']}</p>
+            </div>
+            """, unsafe_allow_html=True
+        )
     with m_col3:
-        st.metric(label="📈 Точность ответов", value=f"{stats['accuracy']}%")
+        st.markdown(
+            f"""
+            <div style="background-color: #FFFFFF; border: 1px solid #E2E8F0; padding: 18px; border-radius: 8px; box-shadow: 0 1px 2px 0 rgba(0,0,0,0.05);">
+                <p style="margin: 0; color: #64748B; font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">📊 Точность ответов</p>
+                <p style="margin: 8px 0 0 0; color: #2563EB; font-size: 28px; font-weight: 600;">{stats['accuracy']}%</p>
+            </div>
+            """, unsafe_allow_html=True
+        )
 
-    st.markdown("---")
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    # Защита прогресс-бара: отображаем его только если были ответы
     if stats["total"] > 0:
-        st.markdown(f"**Ваш прогресс точности (всего ответов: {stats['total']}):**")
+        st.markdown(f"<p style='color: #475569; font-size: 14px;'>Общий прогресс точности (всего ответов: {stats['total']}):</p>", unsafe_allow_html=True)
         st.progress(stats["accuracy"] / 100.0)
+
+        # Контекстный менеджер для безопасного извлечения данных под график активности
+        with get_db_session() as session:
+            df = pd.read_sql(
+                text("SELECT answered_at::date as Дата, is_correct FROM user_stats WHERE user_id = :user_id"),
+                session.bind,
+                params={"user_id": user_id}
+            )
+
+        if not df.empty:
+            st.markdown("<h3 style='font-size: 18px; color: #0F172A; margin-top: 25px;'>Активность изучения по дням</h3>", unsafe_allow_html=True)
+            df_grouped = df.groupby("Дата").count()
+            st.line_chart(df_grouped["is_correct"])
     else:
-        st.info("💡 Вы еще не ответили ни на один вопрос в тренажере. Пройдите тест во вкладке 'Изучение', чтобы здесь появилась статистика!")
+        st.info("ℹ️ Вы еще не ответили ни на один вопрос в тренажере. Ваша аналитическая панель заполнится после первого раунда!")
 
-    engine = get_db_engine()
-    # Извлекаем историю ответов текущего юзера
-    df = pd.read_sql(text("SELECT answered_at::date as Дата, is_correct FROM user_stats WHERE user_id = :user_id"), engine, params={"user_id": USER_ID})
 
-    if not df.empty:
-        st.markdown("### 📈 Активность изучения по дням")
-        # Группируем по дате и считаем количество кликов
-        df_grouped = df.groupby("Дата").count()
-        st.line_chart(df_grouped["is_correct"])
+def main() -> None:
+    # Настройка страницы (строго первая команда Streamlit)
+    st.set_page_config(page_title="EnglishCard", page_icon="🇬🇧", layout="wide")
+
+    # Инициализация сессий
+    init_session_states()
+
+    # Барьер авторизации
+    if not st.session_state.logged_in:
+        log.info("Анонимный пользователь открыл приложение. Перенаправление на барьер авторизации.")
+        run_authentication(next_question)
+
+    user_id: int = st.session_state.user_info["id"]
+    user_name: str = st.session_state.user_info["username"]
+
+    # Отрисовка профиля в Sidebar (новый)
+    with st.sidebar:
+        st.header("👤 Профиль")
+        st.success(f"Вы вошли как: **{user_name}**")
+        if st.button("Выйти", type="secondary"):
+            log.info(f"Пользователь '{user_name}' (ID: {user_id}) вышел из системы.")
+            reset_session_logout()
+            st.rerun()
+
+        if st.session_state.answer_status == "correct":
+            st.divider()
+            st.success("✅ Правильно! Молодец!")
+            trigger_confetti()
+            play_success_sound()
+        elif st.session_state.answer_status == "incorrect":
+            st.error("❌ Неверно. Попробуй заново!")
+
+    st.title("🚀 EnglishCard - Изучай английский с удовольствием!")
+
+    if st.session_state.current_word is None:
+        next_question()
+
+    # Декларация вкладок интерфейса
+    tab_learn, tab_add, tab_delete, tab_stats = st.tabs([
+        "📖 Изучение",
+        "➕ Добавить слово",
+        "🗑️ Удалить слово",
+        "📈 Статистика"
+    ])
+
+    # Распределение изолированных функций по вкладкам согласно схеме
+    with tab_learn:
+        lern_func(user_id)
+
+    with tab_add:
+        add_word_func(user_id)
+
+    with tab_delete:
+        delete_word_func(user_id)
+
+    with tab_stats:
+        stats_func(user_id)
+
+
+if __name__ == '__main__':
+    main()
